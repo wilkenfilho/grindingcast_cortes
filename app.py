@@ -2,7 +2,7 @@
 Grindingcast - Gerador de Cortes de Podcast
 --------------------------------------------
 App em Streamlit que:
-1. Recebe upload temporário de um episódio em MP3
+1. Recebe upload temporário de um episódio em MP3, WAV ou M4A
 2. Recebe o título do jogo / tema do episódio
 3. Transcreve o áudio com timestamps usando Whisper LOCAL (faster-whisper),
    rodando no seu computador — sem gastar tokens/créditos da Groq
@@ -94,7 +94,7 @@ def carregar_modelo_whisper(tamanho_modelo: str, device: str, compute_type: str)
 
 
 def transcrever_audio_local(
-    caminho_mp3: str,
+    caminho_audio: str,
     tamanho_modelo: str,
     device: str,
     compute_type: str,
@@ -111,7 +111,7 @@ def transcrever_audio_local(
     modelo = carregar_modelo_whisper(tamanho_modelo, device, compute_type)
 
     segmentos_generator, info = modelo.transcribe(
-        caminho_mp3,
+        caminho_audio,
         language="pt",
         vad_filter=True,
         beam_size=5,
@@ -317,20 +317,21 @@ if "cortes" not in st.session_state:
 
 col1, col2 = st.columns(2)
 with col1:
-    arquivo_mp3 = st.file_uploader("Upload do episódio (MP3)", type=["mp3"])
+    arquivo_audio = st.file_uploader("Upload do episódio (MP3, WAV ou M4A)", type=["mp3", "wav", "m4a"])
 with col2:
     tema = st.text_input("Título do jogo / tema do episódio", placeholder="Ex: Elden Ring, Baldur's Gate 3...")
 
-processar = st.button("🚀 Transcrever e gerar cortes", type="primary", disabled=not (arquivo_mp3 and api_key))
+processar = st.button("🚀 Transcrever e gerar cortes", type="primary", disabled=not (arquivo_audio and api_key))
 
-if not arquivo_mp3:
-    st.info("Envie um arquivo MP3 para começar.")
+if not arquivo_audio:
+    st.info("Envie um arquivo de áudio (MP3, WAV ou M4A) para começar.")
 elif not api_key:
     st.info("Configure sua chave da Groq em st.secrets para continuar (veja a barra lateral).")
 
-if processar and arquivo_mp3 and api_key:
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmp:
-        tmp.write(arquivo_mp3.read())
+if processar and arquivo_audio and api_key:
+    extensao = os.path.splitext(arquivo_audio.name)[1].lower() or ".mp3"
+    with tempfile.NamedTemporaryFile(delete=False, suffix=extensao) as tmp:
+        tmp.write(arquivo_audio.read())
         caminho_temp = tmp.name
 
     progress_bar = st.progress(0.0)
