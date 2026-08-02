@@ -4,8 +4,9 @@ Grindingcast - Gerador de Cortes de Podcast
 App em Streamlit que:
 1. Recebe upload temporário de um episódio em MP3, WAV ou M4A
 2. Recebe o título do jogo / tema do episódio
-3. Transcreve o áudio com timestamps usando Whisper LOCAL (faster-whisper),
-   rodando no seu computador — sem gastar tokens/créditos da Groq
+3. Transcreve o áudio com timestamps usando a API Whisper da Groq
+   (whisper-large-v3-turbo), dividindo o áudio em partes e pausando
+   automaticamente para respeitar o limite gratuito da Groq
 4. Usa um modelo de linguagem da Groq (gratuito) para sugerir cortes de
    2 a 3 minutos, com título e justificativa para cada corte
 5. Permite exportar a lista de cortes sugeridos em Excel (.xlsx)
@@ -23,10 +24,21 @@ Crie o arquivo `.streamlit/secrets.toml` (veja o exemplo
 A chave NUNCA fica escrita no código-fonte. Se você já expôs uma chave em
 algum lugar (chat, print, repositório público etc.), revogue-a em
 https://console.groq.com/keys e gere outra.
+
+SOBRE O LIMITE GRATUITO DA GROQ:
+O plano free da Groq para transcrição (Whisper) não cobra dinheiro, mas
+tem um teto de uso: aproximadamente 7200 segundos (2 horas) de áudio por
+hora corrida, e 2000 requisições por dia. Para episódios muito longos
+(ex.: ~10h), este app divide o áudio em partes e PAUSA automaticamente
+quando necessário para não estourar esse teto — ou seja, o processo pode
+levar bem mais tempo em relógio de parede do que a duração do episódio,
+mas sem custar nada. Dá para desativar essa pausa automática na barra
+lateral caso você tenha um plano pago da Groq com limites maiores.
 """
 
 import io
 import json
+import math
 import os
 import tempfile
 import time
@@ -35,7 +47,7 @@ from dataclasses import dataclass
 import pandas as pd
 import streamlit as st
 
-from faster_whisper import WhisperModel
+from pydub import AudioSegment
 from groq import Groq
 
 # --------------------------------------------------------------------------
@@ -44,9 +56,16 @@ from groq import Groq
 
 st.set_page_config(page_title="Grindingcast - Gerador de Cortes", page_icon="🎙️", layout="wide")
 
-LLM_MODEL = "llama-3.3-70b-versatile"  # modelo de texto (Groq) para sugerir os cortes
+TRANSCRIPTION_MODEL = "whisper-large-v3-turbo"  # transcrição (Groq)
+LLM_MODEL = "llama-3.3-70b-versatile"           # sugestão de cortes (Groq)
 
-TAMANHOS_WHISPER = ["tiny", "base", "small", "medium", "large-v3"]
+# Duração de cada pedaço de áudio enviado à Groq (segundos).
+CHUNK_DURATION_SECONDS = 600  # 10 minutos por parte
+
+# Limite gratuito aproximado da Groq para transcrição: ~7200s (2h) de
+# áudio processado por hora corrida. Usamos uma margem de segurança.
+LIMITE_SEGUNDOS_POR_HORA = 7200
+MARGEM_SEGURANCA = 0.9  # usa até 90% do teto, para folga
 
 
 @dataclass
@@ -59,7 +78,7 @@ class Corte:
 
 
 # --------------------------------------------------------------------------
-# Funções auxiliares
+# Funções auxiliares - formatação
 # --------------------------------------------------------------------------
 
 def segundos_para_mmss(segundos: float) -> str:
@@ -82,66 +101,156 @@ def formatar_duracao(segundos: float) -> str:
     return f"{s}s"
 
 
-@st.cache_resource(show_spinner=False)
-def carregar_modelo_whisper(tamanho_modelo: str, device: str, compute_type: str) -> WhisperModel:
-    """
-    Carrega (e mantém em cache) o modelo Whisper local. Na primeira
-    execução, o faster-whisper baixa os pesos do modelo automaticamente
-    (é necessário internet só nessa primeira vez); depois fica em cache
-    local no disco.
-    """
-    return WhisperModel(tamanho_modelo, device=device, compute_type=compute_type)
+def mmss_para_segundos(valor: str) -> int:
+    partes = [int(p) for p in valor.split(":")]
+    if len(partes) == 2:
+        m, s = partes
+        return m * 60 + s
+    if len(partes) == 3:
+        h, m, s = partes
+        return h * 3600 + m * 60 + s
+    return 0
 
 
-def transcrever_audio_local(
+# --------------------------------------------------------------------------
+# Divisão do áudio em partes
+# --------------------------------------------------------------------------
+
+def dividir_audio_em_chunks(caminho_audio: str, chunk_duration_seconds: int = CHUNK_DURATION_SECONDS):
+    """
+    Divide o áudio em partes de tamanho fixo (chunk_duration_seconds) e as
+    exporta como MP3 comprimido (64kbps), para ficar bem abaixo do limite
+    de tamanho de arquivo da API da Groq. Retorna:
+        (lista_de_chunks, duracao_total_segundos)
+    onde cada chunk é (caminho_arquivo, offset_segundos, duracao_segundos)
+    """
+    audio = AudioSegment.from_file(caminho_audio)
+    duracao_total_ms = len(audio)
+    chunk_ms = chunk_duration_seconds * 1000
+    n_chunks = max(math.ceil(duracao_total_ms / chunk_ms), 1)
+
+    tmpdir = tempfile.mkdtemp(prefix="grindingcast_chunks_")
+    chunks = []
+    for i in range(n_chunks):
+        inicio_ms = i * chunk_ms
+        fim_ms = min((i + 1) * chunk_ms, duracao_total_ms)
+        pedaco = audio[inicio_ms:fim_ms]
+        caminho_pedaco = os.path.join(tmpdir, f"chunk_{i:04d}.mp3")
+        pedaco.export(caminho_pedaco, format="mp3", bitrate="64k")
+        chunks.append((caminho_pedaco, inicio_ms / 1000.0, (fim_ms - inicio_ms) / 1000.0))
+
+    return chunks, duracao_total_ms / 1000.0
+
+
+# --------------------------------------------------------------------------
+# Controle de cota gratuita da Groq
+# --------------------------------------------------------------------------
+
+def aguardar_cota_disponivel(duracao_chunk: float, historico_envios: list, status_placeholder, respeitar_limite: bool):
+    """
+    Bloqueia (com sleep) até que haja cota suficiente, na janela móvel da
+    última hora, para enviar mais 'duracao_chunk' segundos de áudio à API
+    de transcrição da Groq. historico_envios é uma lista de
+    (timestamp_envio, duracao_segundos) mutável, atualizada aqui.
+    """
+    if not respeitar_limite:
+        return
+
+    limite = LIMITE_SEGUNDOS_POR_HORA * MARGEM_SEGURANCA
+
+    while True:
+        agora = time.time()
+        # descarta envios com mais de 1h (janela móvel)
+        historico_envios[:] = [(t, d) for (t, d) in historico_envios if agora - t < 3600]
+        usado = sum(d for _, d in historico_envios)
+
+        if usado + duracao_chunk <= limite or not historico_envios:
+            return
+
+        envio_mais_antigo = historico_envios[0][0]
+        espera = max(3600 - (agora - envio_mais_antigo) + 2, 1)
+        status_placeholder.warning(
+            f"⏸️ Cota gratuita da Groq quase no limite. Pausando por "
+            f"{formatar_duracao(espera)} antes de continuar (isso é automático, "
+            f"não precisa fazer nada)."
+        )
+        time.sleep(min(espera, 20))
+
+
+# --------------------------------------------------------------------------
+# Transcrição via API da Groq
+# --------------------------------------------------------------------------
+
+def transcrever_chunk_groq(client: Groq, caminho_chunk: str) -> list:
+    with open(caminho_chunk, "rb") as f:
+        resposta = client.audio.transcriptions.create(
+            file=(os.path.basename(caminho_chunk), f.read()),
+            model=TRANSCRIPTION_MODEL,
+            response_format="verbose_json",
+            timestamp_granularities=["segment"],
+            language="pt",
+        )
+    return getattr(resposta, "segments", None) or resposta.get("segments", [])
+
+
+def transcrever_audio_groq(
+    client: Groq,
     caminho_audio: str,
-    tamanho_modelo: str,
-    device: str,
-    compute_type: str,
     progress_bar,
     status_placeholder,
+    respeitar_limite: bool,
 ) -> list:
     """
-    Transcreve o áudio localmente com faster-whisper (sem usar a API da
-    Groq) e retorna uma lista de segmentos no formato:
-        {"start": float, "end": float, "text": str}
-    Atualiza barra de progresso, porcentagem e ETA em tempo real.
+    Transcreve o áudio via API da Groq, dividindo em partes e pausando
+    automaticamente para respeitar o limite gratuito. Retorna uma lista
+    de segmentos: {"start": float, "end": float, "text": str}
     """
-    status_placeholder.info("Carregando modelo Whisper local (pode demorar na primeira vez)...")
-    modelo = carregar_modelo_whisper(tamanho_modelo, device, compute_type)
+    status_placeholder.info("Preparando áudio (dividindo em partes)...")
+    chunks, duracao_total = dividir_audio_em_chunks(caminho_audio)
 
-    segmentos_generator, info = modelo.transcribe(
-        caminho_audio,
-        language="pt",
-        vad_filter=True,
-        beam_size=5,
-    )
-    duracao_total = info.duration or 0.0
+    segmentos_totais = []
+    historico_envios = []
+    segundos_processados = 0.0
+    tempo_inicio = time.time()
 
-    segmentos = []
-    inicio_processamento = time.time()
+    for idx, (caminho_chunk, offset_segundos, duracao_chunk) in enumerate(chunks, start=1):
+        aguardar_cota_disponivel(duracao_chunk, historico_envios, status_placeholder, respeitar_limite)
 
-    for seg in segmentos_generator:
-        segmentos.append({
-            "start": seg.start,
-            "end": seg.end,
-            "text": seg.text.strip(),
-        })
+        segmentos = transcrever_chunk_groq(client, caminho_chunk)
+        for seg in segmentos:
+            # seg pode vir como objeto ou dict, dependendo da versão do SDK
+            inicio = seg["start"] if isinstance(seg, dict) else seg.start
+            fim = seg["end"] if isinstance(seg, dict) else seg.end
+            texto = seg["text"] if isinstance(seg, dict) else seg.text
+            segmentos_totais.append({
+                "start": inicio + offset_segundos,
+                "end": fim + offset_segundos,
+                "text": texto.strip(),
+            })
 
-        fracao = min(seg.end / duracao_total, 1.0) if duracao_total > 0 else 0.0
-        decorrido = time.time() - inicio_processamento
-        eta_segundos = (decorrido / fracao - decorrido) if fracao > 0.01 else None
+        historico_envios.append((time.time(), duracao_chunk))
+        segundos_processados += duracao_chunk
+
+        try:
+            os.remove(caminho_chunk)
+        except OSError:
+            pass
+
+        fracao = min(segundos_processados / duracao_total, 1.0) if duracao_total > 0 else 0.0
+        decorrido = time.time() - tempo_inicio
+        eta = (decorrido / fracao - decorrido) if fracao > 0.01 else None
 
         progress_bar.progress(fracao)
-        texto_eta = f"ETA: {formatar_duracao(eta_segundos)}" if eta_segundos is not None else "ETA: calculando..."
+        texto_eta = f"ETA: {formatar_duracao(eta)}" if eta is not None else "ETA: calculando..."
         status_placeholder.info(
-            f"Transcrevendo localmente... {fracao * 100:.1f}% "
-            f"({formatar_duracao(seg.end)} / {formatar_duracao(duracao_total)}) — {texto_eta}"
+            f"Transcrevendo via Groq... {fracao * 100:.1f}% "
+            f"(parte {idx}/{len(chunks)} — {formatar_duracao(segundos_processados)} / "
+            f"{formatar_duracao(duracao_total)}) — {texto_eta}"
         )
 
     progress_bar.progress(1.0)
-    status_placeholder.success(f"Transcrição local concluída em {formatar_duracao(time.time() - inicio_processamento)}.")
-    return segmentos
+    status_placeholder.success(f"Transcrição concluída em {formatar_duracao(time.time() - tempo_inicio)}.")
+    return segmentos_totais
 
 
 def montar_transcricao_formatada(segmentos: list) -> str:
@@ -152,6 +261,10 @@ def montar_transcricao_formatada(segmentos: list) -> str:
         linhas.append(f"[{inicio} - {fim}] {seg['text']}")
     return "\n".join(linhas)
 
+
+# --------------------------------------------------------------------------
+# Sugestão de cortes via LLM da Groq
+# --------------------------------------------------------------------------
 
 def gerar_sugestoes_de_corte(client: Groq, transcricao_formatada: str, tema: str) -> list:
     """
@@ -214,17 +327,6 @@ formato exato abaixo:
     return dados.get("cortes", [])
 
 
-def mmss_para_segundos(valor: str) -> int:
-    partes = [int(p) for p in valor.split(":")]
-    if len(partes) == 2:
-        m, s = partes
-        return m * 60 + s
-    if len(partes) == 3:
-        h, m, s = partes
-        return h * 3600 + m * 60 + s
-    return 0
-
-
 def gerar_excel(cortes: list) -> bytes:
     linhas = []
     for c in cortes:
@@ -255,7 +357,7 @@ def gerar_excel(cortes: list) -> bytes:
 # --------------------------------------------------------------------------
 
 st.title("🎙️ Grindingcast — Gerador de Cortes")
-st.caption("Transcrição 100% local (Whisper) + sugestões de cortes de 2 a 3 minutos usando IA da Groq")
+st.caption("Transcrição via Groq Whisper + sugestões de cortes de 2 a 3 minutos usando IA da Groq")
 
 
 def obter_api_key_groq() -> str:
@@ -285,22 +387,21 @@ with st.sidebar:
         )
 
     st.markdown("---")
-    st.subheader("Whisper local")
-    tamanho_modelo = st.selectbox(
-        "Tamanho do modelo",
-        TAMANHOS_WHISPER,
-        index=TAMANHOS_WHISPER.index("small"),
+    st.subheader("Transcrição (Groq Whisper)")
+    respeitar_limite = st.checkbox(
+        "Respeitar limite gratuito da Groq (pausa automática)",
+        value=True,
         help=(
-            "tiny/base = mais rápido, menos preciso. "
-            "medium/large-v3 = mais preciso, bem mais lento sem GPU."
+            "Deixe marcado se você usa o plano gratuito da Groq. O app vai "
+            "pausar automaticamente para não estourar o teto de ~2h de "
+            "áudio por hora. Desmarque só se tiver um plano pago com "
+            "limites maiores."
         ),
     )
-    device = st.selectbox("Dispositivo", ["cpu", "cuda"], index=0, help="Use 'cuda' se tiver GPU NVIDIA com CUDA configurado.")
-    compute_type = st.selectbox(
-        "Precisão (compute_type)",
-        ["int8", "int8_float16", "float16", "float32"],
-        index=0,
-        help="int8 é o mais rápido/leve para CPU. float16 é recomendado para GPU.",
+    st.caption(
+        "No plano gratuito, transcrever não custa dinheiro, mas tem um "
+        "teto de uso por hora. Um episódio de ~10h pode levar algumas "
+        "horas de relógio no total, sem gastar nada."
     )
 
     st.markdown("---")
@@ -324,14 +425,6 @@ with col2:
 if arquivo_audio is not None:
     tamanho_mb = arquivo_audio.size / (1024 * 1024)
     st.caption(f"Arquivo: {arquivo_audio.name} — {tamanho_mb:.1f}MB")
-    if tamanho_mb > 300 and tamanho_modelo in ("medium", "large-v3") and device == "cpu":
-        st.warning(
-            f"Esse arquivo é grande ({tamanho_mb:.0f}MB, provavelmente um episódio longo). "
-            "Rodando em CPU com o modelo "
-            f"'{tamanho_modelo}', a transcrição pode levar muitas horas. "
-            "Para episódios longos, considere usar 'tiny', 'base' ou 'small' "
-            "na barra lateral (ou 'device = cuda' se tiver GPU)."
-        )
 
 processar = st.button("🚀 Transcrever e gerar cortes", type="primary", disabled=not (arquivo_audio and api_key))
 
@@ -346,20 +439,17 @@ if processar and arquivo_audio and api_key:
         tmp.write(arquivo_audio.read())
         caminho_temp = tmp.name
 
+    client = Groq(api_key=api_key)
     progress_bar = st.progress(0.0)
     status = st.empty()
     try:
-        segmentos = transcrever_audio_local(
-            caminho_temp, tamanho_modelo, device, compute_type, progress_bar, status
-        )
+        segmentos = transcrever_audio_groq(client, caminho_temp, progress_bar, status, respeitar_limite)
         st.session_state.segmentos = segmentos
 
         if not segmentos:
             st.warning("Nenhum trecho de fala foi identificado no áudio.")
         else:
             transcricao_formatada = montar_transcricao_formatada(segmentos)
-
-            client = Groq(api_key=api_key)
             with st.spinner("Gerando sugestões de cortes com IA da Groq..."):
                 cortes = gerar_sugestoes_de_corte(client, transcricao_formatada, tema)
             st.session_state.cortes = cortes
