@@ -43,6 +43,8 @@ import os
 import tempfile
 import time
 from dataclasses import dataclass
+import audioop  # tenta forçar a importação
+from pydub import AudioSegment
 
 import pandas as pd
 import streamlit as st
