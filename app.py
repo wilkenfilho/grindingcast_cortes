@@ -321,6 +321,18 @@ with col1:
 with col2:
     tema = st.text_input("Título do jogo / tema do episódio", placeholder="Ex: Elden Ring, Baldur's Gate 3...")
 
+if arquivo_audio is not None:
+    tamanho_mb = arquivo_audio.size / (1024 * 1024)
+    st.caption(f"Arquivo: {arquivo_audio.name} — {tamanho_mb:.1f}MB")
+    if tamanho_mb > 300 and tamanho_modelo in ("medium", "large-v3") and device == "cpu":
+        st.warning(
+            f"Esse arquivo é grande ({tamanho_mb:.0f}MB, provavelmente um episódio longo). "
+            "Rodando em CPU com o modelo "
+            f"'{tamanho_modelo}', a transcrição pode levar muitas horas. "
+            "Para episódios longos, considere usar 'tiny', 'base' ou 'small' "
+            "na barra lateral (ou 'device = cuda' se tiver GPU)."
+        )
+
 processar = st.button("🚀 Transcrever e gerar cortes", type="primary", disabled=not (arquivo_audio and api_key))
 
 if not arquivo_audio:

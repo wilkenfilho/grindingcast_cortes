@@ -42,6 +42,18 @@ pip install -r requirements.txt
 > em CPU — se não tiver GPU NVIDIA com CUDA, prefira `tiny`, `base` ou
 > `small`.
 
+## Episódios longos (arquivos grandes, até 1GB)
+
+O limite de upload já vem configurado em `.streamlit/config.toml` para
+**1GB** (o padrão do Streamlit é só 200MB). Isso é lido automaticamente
+quando você roda `streamlit run app.py` na mesma pasta.
+
+Para um podcast de ~10h em CPU, prefira os modelos `tiny`, `base` ou
+`small` na barra lateral — modelos `medium`/`large-v3` sem GPU podem levar
+muitas horas para transcrever um episódio desse tamanho. Se tiver GPU
+NVIDIA com CUDA, selecione `device = cuda` para acelerar bastante e poder
+usar modelos maiores.
+
 ## Como rodar
 
 ```bash

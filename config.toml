@@ -1,0 +1,4 @@
+[server]
+# Tamanho máximo de upload em MB. Padrão do Streamlit é 200MB;
+# aumentado para suportar episódios longos (~10h) em MP3/WAV/M4A.
+maxUploadSize = 1024
